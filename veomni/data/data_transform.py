@@ -89,4 +89,11 @@ def process_sft_example(
 
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
+    
+    # Preserve original dataset fields for validation
+    preserved_fields = ['reward_model', 'rubrics', 'data_source', 'id']
+    for field in preserved_fields:
+        if field in example:
+            tokenized_example[field] = example[field]
+    
     return [tokenized_example]

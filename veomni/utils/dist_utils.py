@@ -34,6 +34,38 @@ def all_gather(tensor: "torch.Tensor", world_size: int) -> "torch.Tensor":
     return output_tensor.view(-1, *tensor.size()[1:])
 
 
+def all_gather_defaultdict_v1(local_dict, device='cuda:0'):
+    """
+    Gather dict from all processes to specified device using all_gather_object
+    """
+    local_dict = dict(local_dict)
+    world_size = dist.get_world_size()
+    
+    # Gather all dictionaries
+    gathered_dicts = [None] * world_size
+    dist.all_gather_object(gathered_dicts, local_dict)
+    
+    # Merge all dictionaries
+    merged_dict = {}
+    
+    for rank_dict in gathered_dicts:
+        for dataset_name, metrics in rank_dict.items():
+            if dataset_name not in merged_dict:
+                merged_dict[dataset_name] = {}
+            for metric_name, values in metrics.items():
+                if metric_name == 'total_samples':
+                    # Sum total_samples across ranks
+                    if metric_name not in merged_dict[dataset_name]:
+                        merged_dict[dataset_name][metric_name] = 0
+                    merged_dict[dataset_name][metric_name] += values
+                else:
+                    # Extend lists for other metrics
+                    if metric_name not in merged_dict[dataset_name]:
+                        merged_dict[dataset_name][metric_name] = []
+                    merged_dict[dataset_name][metric_name].extend(values)
+    return merged_dict
+
+
 def all_reduce(
     data: Union[int, float, List[Union[int, float]], "torch.Tensor"],
     op: Literal["mean", "sum", "max"] = "mean",

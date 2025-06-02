@@ -64,12 +64,12 @@ class ChatTemplate(ABC):
 class DefaultTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
-        for message in messages:
+        for m_i, message in enumerate(messages):
             content_str = message["role"].title() + ": " + message["content"].strip() + self.tokenizer.eos_token + "\n"
             content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
-            if message["loss_mask"] == 1:
+            if m_i == len(messages) - 1:
                 labels += content_ids
             else:
                 labels += [IGNORE_INDEX] * len(content_ids)
@@ -223,12 +223,12 @@ class JanusTemplate(ChatTemplate):
 class ChatmlTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         input_ids, attention_mask, labels = [], [], []
-        for message in messages:
+        for m_i, message in enumerate(messages):
             content_str = "<|im_start|>" + message["role"] + "\n" + message["content"].strip() + "<|im_end|>\n"
             content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
-            if message["loss_mask"] == 1:
+            if m_i == len(messages) - 1 and message["role"] == "assistant":
                 labels += content_ids
             else:
                 labels += [IGNORE_INDEX] * len(content_ids)

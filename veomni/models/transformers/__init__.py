@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import deepseek_v3, llama, qwen2, qwen2_vl
+from . import llama, qwen2, qwen2_vl, qwen3
 
 
-__all__ = ["qwen2_vl", "deepseek_v3", "qwen2", "llama"]
+__all__ = ["qwen2_vl", "qwen2", "llama", "qwen3"]
