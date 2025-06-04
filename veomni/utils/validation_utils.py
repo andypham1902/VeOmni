@@ -11,6 +11,7 @@ import time
 from verl.workers.rollout.vllm_rollout import vLLMRollout
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 from verl.protocol import DataProto
+from verl.utils.device import get_device_name, get_torch_device
 from tensordict import TensorDict
 
 logger = logging.getLogger(__name__)
@@ -166,9 +167,7 @@ class ValidationVLLMManager:
         
         # Prepare meta info
         meta_info = {
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "do_sample": generation_kwargs.get("do_sample", True),
-            "validate": generation_kwargs.get("validate", False)
+            "eos_token_id": generation_kwargs["eos_token_id"],
         }
         
         # Create DataProto
@@ -189,7 +188,6 @@ class ValidationVLLMManager:
         # start = time.time()
         # Extract and decode responses
         responses = results.batch["responses"]  # Shape: (batch_size, response_length)
-        
         decoded_responses = []
         for i in range(responses.size(0)):
             response_ids = responses[i]
@@ -199,9 +197,11 @@ class ValidationVLLMManager:
             response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
             decoded_responses.append({
                 "response": response_text,
-                "prompt_length": input_ids.size(1),
+                "prompt_length": attention_mask[i].sum().item(),
                 "response_length": response_ids.size(0)
             })
+        # clear kv cache
+        get_torch_device().empty_cache()
         # end = time.time() - start
         # logger.info(f"Decoded responses in {end:.4f} seconds")
         return decoded_responses

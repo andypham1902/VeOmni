@@ -87,7 +87,9 @@ class DataCollatorWithPadding(DataCollator):
 
         for key in batch.keys():
             # process padding features
-            if key in ["input_ids", "attention_mask", "position_ids", "images_seq_mask"]:
+            if key in ["input_ids", "images_seq_mask"]:
+                batch[key] = pad_sequence(batch[key], batch_first=True, padding_value=151645)
+            elif key in ["attention_mask", "position_ids"]:
                 batch[key] = pad_sequence(batch[key], batch_first=True, padding_value=0)
             elif key in ["labels", "labels_image"]:
                 batch[key] = pad_sequence(batch[key], batch_first=True, padding_value=IGNORE_INDEX)

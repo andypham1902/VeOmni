@@ -44,7 +44,7 @@ def test_instruction_following_strict(inp, response):
 #     return mean(x['strict_prompt_acc'] for x in jobs)
 
 def compute_score(solution_str, prompt_id):
-    with open('/home/andrew/VeOmni/veomni/utils/reward_score/ifeval/scoring.json', 'r') as f:
+    with open('/data/lipsync/andrew/VeOmni/veomni/utils/reward_score/ifeval/scoring.json', 'r') as f:
         scoring = json.load(f)
     data = scoring[prompt_id]
     result = test_instruction_following_strict(data, solution_str)

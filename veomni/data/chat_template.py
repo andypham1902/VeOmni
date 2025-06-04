@@ -232,7 +232,6 @@ class ChatmlTemplate(ChatTemplate):
                 labels += content_ids
             else:
                 labels += [IGNORE_INDEX] * len(content_ids)
-
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
         model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
         return model_inputs
@@ -246,12 +245,41 @@ class ChatmlTemplate(ChatTemplate):
             "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
         )
 
+class ChatmlValidationTemplate(ChatTemplate):
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        input_ids, attention_mask, labels = [], [], []
+        for m_i, message in enumerate(messages):
+            content_str = "<|im_start|>" + message["role"] + "\n" + message["content"].strip() + "<|im_end|>\n"
+            content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
+            input_ids += content_ids
+            attention_mask += [1] * len(content_ids)
+        # Generation prompt
+        if messages[-1]["role"] != "assistant":
+            content_ids += self.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+            input_ids += content_ids
+            attention_mask += [1] * len(content_ids)
+
+        position_ids = torch.arange(len(input_ids), dtype=torch.long)
+
+        model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask, "position_ids": position_ids}
+        model_inputs = {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+        return model_inputs
+
+    def get_jinja_template(self) -> str:
+        return (
+            "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}"
+            "{% for message in messages %}"
+            "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] | trim + '<|im_end|>\n' }}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+        )
 
 TEMPLATES = {
     "default": DefaultTemplate,
     "llama2": Llama2Template,
     "chatml": ChatmlTemplate,
     "Janus": JanusTemplate,
+    "chatml_val": ChatmlValidationTemplate,  # For validation
 }
 
 

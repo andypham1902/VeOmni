@@ -1,14 +1,14 @@
 model:
-  model_path: "Qwen/Qwen3-0.6B"
+  model_path: "Qwen/Qwen3-8B"
   attn_implementation: flash_attention_2
-  tokenizer_path: "Qwen/Qwen3-0.6B"
+  tokenizer_path: "Qwen/Qwen3-8B"
 
 data:
-  train_path: /home/andrew/VeOmni/_data/medqa_train_messages.parquet
-  val_path: /home/andrew/VeOmni/_data/test_medx_medqa_ifeval_hb_sample.parquet
+  train_path: /data/lipsync/andrew/VeOmni/_data/medqa_train_messages.parquet
+  val_path: /data/lipsync/andrew/VeOmni/_data/test_medx_medqa_ifeval_hb.parquet
   data_type: conversation
   chat_template: chatml
-  max_seq_len: 16384
+  max_seq_len: 12288
   # train_size: 1145097229 #  7,679,732,074 1,139,111,100 329,724,320 it automatic override by train_torch_v2.py scripts # total of tokens/epoch
   text_keys: prompt
   pin_memory: false
@@ -20,7 +20,7 @@ data:
   prefetch_factor: 2
 
 train:
-  output_dir: /home/andrew/VeOmni/ckpts/qwen3_test
+  output_dir: /data/lipsync/andrew/VeOmni/ckpts/qwen3_test
   data_parallel_mode: fsdp1
   ulysses_parallel_size: 1
   global_batch_size: 32
@@ -46,12 +46,12 @@ train:
   enable_activation_offload: false
   init_device: cuda
   enable_full_determinism: false
-  empty_cache_steps: 2000
+  empty_cache_steps: 26
   ckpt_manager: dcp
   load_checkpoint_path: ""
   save_steps: 1000
   save_hf_weights: true
   use_wandb: true
-  wandb_project: test_veomni
-  wandb_name: qwen3_0.6b
-  validation_steps: 2
+  wandb_project: veomni_quick_exps
+  wandb_name: qwen3_8b_12k_medqa
+  validation_steps: 26

@@ -16,6 +16,8 @@ import pandas as pd
 from openai import OpenAI
 from omegaconf import DictConfig
 import numpy as np
+from multiprocessing import Pool
+import functools
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -41,7 +43,9 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
+from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_name, get_torch_device
+import logging
 
 logger = helper.create_logger(__name__)
 
@@ -74,6 +78,10 @@ def compute_score(generation_result: Dict[str, Any], ground_truth: str, data_sou
     else:
         raise NotImplementedError(f"Unsupported dataset: {data_source}. Please implement compute_score for this dataset.")
     return res
+
+def compute_score_wrapper(args):
+    generation_result, ground_truth, dataset_name = args
+    return compute_score(generation_result['response'], ground_truth, dataset_name)
 
 
 @dataclass
@@ -191,7 +199,6 @@ def run_validation(
             with torch.cuda.amp.autocast(enabled=args.train.enable_mixed_precision, dtype=model_dtype):
                 for batch_idx in validation_tqdm:
                     micro_batches: List[Dict[str, Any]] = next(val_iterator)
-                        
                     for micro_batch in micro_batches:
                         # Extract and remove non-tensor fields BEFORE moving to GPU and collation
                         dataset_names = micro_batch['data_source']
@@ -210,66 +217,58 @@ def run_validation(
                         # Get original inputs
                         input_ids = micro_batch['input_ids']
                         attention_mask = micro_batch['attention_mask']
-                        labels = micro_batch['labels']
-                        
-                        # Prepare inputs for generation and extract ground truths
-                        generation_results = []
-                        
-                        for i in range(input_ids.size(0)):
-                            # Find where the answer starts (where labels != -100) for question extraction
-                            answer_mask = (labels[i] != -100)
-                            if answer_mask.any():
-                                # Get the first position where labels are not -100 (start of answer)
-                                answer_start_pos = answer_mask.nonzero(as_tuple=True)[0][0].item()
-                            else:
-                                # If no answer is present, use the full input length
-                                answer_start_pos = input_ids.size(1)
+                        position_ids = micro_batch['position_ids']
 
-                            # Extract question part (input up to answer start)
-                            question_ids = input_ids[i, :answer_start_pos]
-                            question_ids = question_ids.contiguous()
+                        # Debug logging for first sample
+                        if batch_idx == 0:
+                        # if dataset_names[i] == "openai/HealthBench":
+                            question_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                            logger.info(f"GPU {args.train.global_rank} - Sample 0 - Question: {question_text[:200]}...")
+                            logger.info(f"GPU {args.train.global_rank} - Sample 0 - Data Source: {dataset_names[0]}")
+                            logger.info(f"GPU {args.train.global_rank} - Sample 0 - ID: {ids[0]}")
+                            logger.info(f"GPU {args.train.global_rank} - Using validation manager for generation.")
                             
-                            # FIXED: Ensure consistent device and dtype for generation inputs
-                            question_input = question_ids.unsqueeze(0)
-                            question_attention = torch.ones_like(question_input, device=question_input.device, dtype=question_input.dtype)
-                            
-                            # Debug logging for first few samples  
-                            # if batch_idx == 0 and i < 2:
-                            if dataset_names[i] == "openai/HealthBench":
-                                question_text = tokenizer.decode(question_ids, skip_special_tokens=True)
-                                logger.info(f"GPU {args.train.global_rank} - Sample {i} - Question: {question_text[:200]}...")
-                                logger.info(f"GPU {args.train.global_rank} - Sample {i} - Data Source: {dataset_names[i]}")
-                                logger.info(f"GPU {args.train.global_rank} - Sample {i} - ID: {ids[i]}")
-                                logger.info(f"GPU {args.train.global_rank} - Using validation manager for generation.")
-                            generation_kwargs = {
-                                "do_sample": False,
-                                "validate": True,
-                            }
+                        generation_kwargs = {
+                            "bos_token_id": 151643,
+                            "do_sample": False,
+                            "validate": True,
+                            "eos_token_id": [
+                                151645,
+                                151643
+                            ],
+                            "pad_token_id": 151643,
+                            "temperature": 0.0,
+                        }
+                        generation_results = validation_manager.generate_responses(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            **generation_kwargs
+                        )
 
-                            generated_texts = validation_manager.generate_responses(
-                                input_ids=question_input,
-                                attention_mask=question_attention,
-                                **generation_kwargs
-                            )
-                            # generated_text = "Testing"
-                            generation_results.extend(generated_texts)
-
-                            # if batch_idx == 0 and i < 2:  # Log first few samples of first batch
-                            #     logger.info(f"GPU {args.train.global_rank} - Batch {batch_idx}, Sample {i} - Generated: {generated_texts[0]['response'][:200]}...")
-                            if dataset_names[i] == "openai/HealthBench":
-                                logger.info(f"GPU {args.train.global_rank} - Batch {batch_idx}, Sample {i} - Ground Truth: {reward_models[i][:200]}...")
-
+                        if batch_idx == 0:  # Log first sample of first batch
+                            logger.info(f"GPU {args.train.global_rank} - Sample 0 - Generated: {generation_results[0]['response'][:200]}...")
+                        # if dataset_names[i] == "openai/HealthBench":
+                            # logger.info(f"GPU {args.train.global_rank} - Batch {batch_idx}, Sample {i} - Ground Truth: {reward_models[i][:200]}...")
                         assert len(generation_results) == len(reward_models), "Mismatch in generated results size"
                         # Update metrics per dataset
-                        for generation_result, ground_truth, dataset_name in zip(generation_results, reward_models, dataset_names):
-                            score = compute_score(generation_result['response'], ground_truth, dataset_name)
-                            
+                        # Use multiprocessing to parallelize score computation
+                        
+                        # Prepare arguments for multiprocessing
+                        score_args = [(gen_result, gt, ds_name) for gen_result, gt, ds_name in zip(generation_results, reward_models, dataset_names)]
+                        
+                        # Use multiprocessing to compute scores in parallel
+                        with Pool(processes=len(score_args)) as pool:  # Limit to 8 processes to avoid overhead
+                            scores = pool.map(compute_score_wrapper, score_args)
+                        
+                        # Update metrics per dataset
+                        for (generation_result, ground_truth, dataset_name), score in zip(zip(generation_results, reward_models, dataset_names), scores):
                             # Track metrics per dataset
                             dataset_metrics[dataset_name]['scores'].append(score)
                             dataset_metrics[dataset_name]['prompt_lengths'].append(generation_result['prompt_length'])
                             dataset_metrics[dataset_name]['response_lengths'].append(generation_result['response_length'])
                             dataset_metrics[dataset_name]['total_samples'] += 1
-                        
+
                     total_batches += 1
                     
                     # Update progress bar
@@ -278,9 +277,7 @@ def run_validation(
                     )
                     
                 validation_tqdm.close()
-    
-
-
+    time.sleep(2)  # Allow time for vLLM to release memory
     # Aggregate per-dataset metrics across all GPUs
     val_metrics = all_gather_defaultdict_v1(dataset_metrics)
     logger.info_rank0(f"Gathered metrics from datasets across all GPUs: {val_metrics}")
@@ -296,7 +293,6 @@ def run_validation(
             logger.info_rank0(f"Gathered '{dataset_name}' successfully - {metrics['total_samples']} samples, ")
 
     model.train()  # Switch back to training mode
-
     return val_metrics_summary
 
 
@@ -346,6 +342,13 @@ def main():
             max_seq_len=args.data.max_seq_len,
             text_keys=args.data.text_keys,
         )
+        chat_template_val = build_chat_template("chatml_val", tokenizer)
+        transform_val = partial(
+            process_sft_example,
+            chat_template=chat_template_val,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
+        )
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
@@ -388,13 +391,11 @@ def main():
         logger.info_rank0("Building validation dataset")
         val_dataset = build_mapping_dataset(
             args.data.val_path,
-            transform=transform,
+            transform=transform_val,
         )
         
-        # Build validation dataloader WITHOUT concatenation/packing for proper sample-level evaluation
-        from veomni.data.data_collator import DataCollatorWithPadding, CollatePipeline, MakeMicroBatchCollator
+        from veomni.data.data_collator import DataCollatorWithPadding, MakeMicroBatchCollator
         from veomni.distributed.parallel_state import get_parallel_state
-        from veomni.data.data_loader import StatefulDataLoader, StatefulDistributedSampler
         from torch.utils.data.distributed import DistributedSampler
         from torch.utils.data import DataLoader
 
@@ -417,16 +418,15 @@ def main():
             shuffle=False,
             drop_last=False,  # This ensures all samples are used
         )
-        # Create simple validation dataloader without dynamic batching
         val_dataloader = DataLoader(
             val_dataset,
-            batch_size=1,  # Process one sample at a time
+            batch_size=8,
             sampler=val_sampler,
-            num_workers=min(args.data.num_workers, 2),  # Reduce workers for validation
+            num_workers=args.data.num_workers,
             collate_fn=val_collate_fn,
             pin_memory=args.data.pin_memory,
             drop_last=False,  # Don't drop last batch in validation
-            prefetch_factor=1,  # Reduce prefetch for validation
+            prefetch_factor=args.data.prefetch_factor,
         )
 
         logger.info_rank0(f"Validation dataloader built with {len(val_dataset)} samples")
@@ -552,22 +552,18 @@ def main():
         # vLLM configuration
     vllm_config = DictConfig({
         "tensor_model_parallel_size": 1,
-        "max_num_batched_tokens": 8448,
+        "max_num_batched_tokens": 8448 * 8,
         "dtype": "bfloat16",
-        "enforce_eager": True,
+        "enforce_eager": False,
+        "free_cache_engine": False,
         "gpu_memory_utilization": 0.85,
         "response_length": 8192,
         "prompt_length": 128,
         "max_model_len": 8448,
         "disable_log_stats": True,
-        "enable_chunked_prefill": True,
-        "enable_prefix_caching": True,
+        "enable_chunked_prefill": False,
+        "enable_prefix_caching": False,
         "load_format": "dummy_hf",
-        "val_kwargs": {
-            "top_k": 1,
-            "top_p": 1.0,
-            "temperature": 0.0,
-        }
     })
     
     validation_manager = ValidationVLLMManager(
@@ -621,6 +617,7 @@ def main():
             total_loss = 0
             torch.cuda.synchronize()
             start_time = time.time()
+            log_gpu_memory_usage(f"Before backward step {global_step}", logger=logger, level=logging.INFO)
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
 
@@ -659,10 +656,10 @@ def main():
 
             # Run validation periodically
             validation_metrics = {}
-            if val_dataloader and global_step % args.train.validation_steps == 0:
+            if val_dataloader and (global_step % args.train.validation_steps == 0 or global_step == 1):
                 logger.info_rank0(f"Starting validation at step {global_step}")
-                offload_fsdp_model_to_cpu(model)
-                offload_fsdp_optimizer(optimizer=optimizer)
+                # offload_fsdp_model_to_cpu(model)
+                # offload_fsdp_optimizer(optimizer=optimizer)
                 validation_metrics = run_validation(
                     model=model,
                     val_dataloader=val_dataloader,  # Use the properly distributed dataloader
@@ -673,8 +670,8 @@ def main():
                     validation_manager=validation_manager,
                     limit_batches=args.train.validation_limit,
                 )
-                load_fsdp_model_to_gpu(model)
-                load_fsdp_optimizer(optimizer=optimizer, device_id=get_torch_device().current_device())
+                load_fsdp_model_to_gpu(model.cuda())
+                # load_fsdp_optimizer(optimizer=optimizer, device_id=get_torch_device().current_device())
                 
                 # Log validation metrics
                 if args.train.global_rank == 0:

@@ -130,7 +130,7 @@ def get_openai_response(conversation, rubrics):
     return rubrics_with_result
 
 # def compute_score(solution_str, prompt_id):
-#     with open('/home/andrew/VeOmni/veomni/utils/reward_score/healthbench/scoring.json', 'r') as f:
+#     with open('/data/lipsync/andrew/VeOmni/veomni/utils/reward_score/healthbench/scoring.json', 'r') as f:
 #         scoring = json.load(f)
 #     data = scoring[prompt_id]
 #     conversation = convo_to_str(data['prompt'], solution_str)
