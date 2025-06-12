@@ -258,7 +258,7 @@ def run_validation(
                         score_args = [(gen_result, gt, ds_name) for gen_result, gt, ds_name in zip(generation_results, reward_models, dataset_names)]
                         
                         # Use multiprocessing to compute scores in parallel
-                        with Pool(processes=len(score_args)) as pool:  # Limit to 8 processes to avoid overhead
+                        with Pool(processes=2) as pool:  # Limit to 2 processes to avoid overhead
                             scores = pool.map(compute_score_wrapper, score_args)
                         
                         # Update metrics per dataset

@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from veomni.utils.reward_score.healthbench.avg_healthbench import calculate_rubrics_scores
 # Initialize pandarallel
 import json
+import random
 
 load_dotenv()
 
@@ -16,6 +17,13 @@ client = AzureOpenAI(
     azure_endpoint=os.getenv("LLM_BASE_ENDPOINT_41")
 )
 model_name = os.getenv("DEPLOYMENT_NAME_41")
+
+client_2 = AzureOpenAI(
+    api_key=os.getenv("A_API_KEY_41_2"),
+    api_version=os.getenv("OPENAI_API_VERSION"),
+    azure_endpoint=os.getenv("LLM_BASE_ENDPOINT_41_2")
+)
+model_name_2 = os.getenv("DEPLOYMENT_NAME_41_2")
 
 
 INSTRUCTION = """
@@ -103,8 +111,14 @@ def get_openai_response(conversation, rubrics):
         rubric_item = rubric["criterion"]
         while True:
             try:
-                response = client.chat.completions.create(
-                    model=model_name,
+                if random.random() < 0.5:
+                    client_to_use = client
+                    model_to_use = model_name
+                else:
+                    client_to_use = client_2
+                    model_to_use = model_name_2
+                response = client_to_use.chat.completions.create(
+                    model=model_to_use,
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": INSTRUCTION.replace("<<conversation>>", conversation).replace("<<rubric_item>>", rubric_item)},
@@ -129,17 +143,17 @@ def get_openai_response(conversation, rubrics):
     # print(rubrics_with_result)
     return rubrics_with_result
 
-# def compute_score(solution_str, prompt_id):
-#     with open('/data/lipsync/andrew/VeOmni/veomni/utils/reward_score/healthbench/scoring.json', 'r') as f:
-#         scoring = json.load(f)
-#     data = scoring[prompt_id]
-#     conversation = convo_to_str(data['prompt'], solution_str)
-#     # print(conversation)
-#     result = get_openai_response(conversation, data['rubrics'])
-#     return calculate_rubrics_scores(result)
-
 def compute_score(solution_str, prompt_id):
-    return 0.5
+    with open('/data/lipsync/andrew/VeOmni/veomni/utils/reward_score/healthbench/scoring.json', 'r') as f:
+        scoring = json.load(f)
+    data = scoring[prompt_id]
+    conversation = convo_to_str(data['prompt'], solution_str)
+    # print(conversation)
+    result = get_openai_response(conversation, data['rubrics'])
+    return calculate_rubrics_scores(result)
+
+# def compute_score(solution_str, prompt_id):
+#     return 0.5
 
 
 if __name__ == "__main__":
