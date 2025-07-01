@@ -17,12 +17,10 @@ from veomni.data import (
     OmniDataCollatorWithPacking,
     OmniDataCollatorWithPadding,
     OmniSequenceShardCollator,
-    build_byted_dataset,
     build_dataloader,
+    build_iterative_dataset,
     build_mapping_dataset,
     build_multimodal_chat_template,
-    build_multisource_dataset,
-    build_streaming_dataloader,
 )
 from veomni.data.constants import IMAGE_INPUT_INDEX
 from veomni.data.multimodal.preprocess import conv_preprocess
@@ -194,8 +192,15 @@ def main():
         )
 
     if args.data.dataloader_type == "native":
-        train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
-        args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
+        if args.data.datasets_type == "iterable":
+            logger.info_rank0("Start building iterative dataset")
+            train_dataset = build_iterative_dataset(args.data.train_path, transform=transform, seed=args.train.seed)
+            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
+        elif args.data.datasets_type == "mapping":
+            logger.info_rank0("Start building mapping dataset")
+            train_dataset = build_mapping_dataset(args.data.train_path, transform=transform)
+            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
+
         train_dataloader = build_dataloader(
             dataset=train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -210,53 +215,6 @@ def main():
             bsz_warmup_ratio=args.train.bsz_warmup_ratio,
             dyn_bsz_margin=args.train.dyn_bsz_margin,
             dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-            num_workers=args.data.num_workers,
-            drop_last=args.data.drop_last,
-            pin_memory=args.data.pin_memory,
-            prefetch_factor=args.data.prefetch_factor,
-        )
-    elif args.data.dataloader_type == "streaming":
-        if args.data.enable_multisource:
-            train_dataset = build_multisource_dataset(
-                data_path=args.data.train_path,
-                dataloader_batch_size=args.train.dataloader_batch_size,
-                max_seq_len=args.data.max_seq_len,
-                transform=transform,
-                shuffle=True,
-                shuffle_shard_nums=args.data.shuffle_shard_nums,
-                prefetch_factor=args.data.prefetch_factor,
-                num_workers=args.data.num_workers,
-                predownload_factor=args.data.predownload_factor,
-                silent_exception=args.data.silent_exception,
-            )
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size)
-        else:
-            train_dataset = build_byted_dataset(
-                data_path=args.data.train_path,
-                dataloader_batch_size=args.train.dataloader_batch_size,
-                transform=transform,
-                shuffle=True,
-                shuffle_seed=args.train.seed,
-                shuffle_shard_nums=args.data.shuffle_shard_nums,
-                split_nums=args.data.split_nums,
-                predownload_factor=args.data.predownload_factor,
-                silent_exception=args.data.silent_exception,
-            )
-            args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
-        train_dataloader = build_streaming_dataloader(
-            dataset=train_dataset,
-            micro_batch_size=args.train.micro_batch_size,
-            global_batch_size=args.train.global_batch_size,
-            dataloader_batch_size=args.train.dataloader_batch_size,
-            max_seq_len=args.data.max_seq_len,
-            train_steps=args.train.train_steps,
-            rmpad=args.train.rmpad,
-            rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-            bsz_warmup_ratio=args.train.bsz_warmup_ratio,
-            dyn_bsz_runtime=args.train.dyn_bsz_runtime,
-            dyn_bsz_margin=args.train.dyn_bsz_margin,
-            dyn_bsz_buffer_size=args.train.dyn_bsz_buffer_size,
-            collate_fn=data_collate_fn,
             num_workers=args.data.num_workers,
             drop_last=args.data.drop_last,
             pin_memory=args.data.pin_memory,
