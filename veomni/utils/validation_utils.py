@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from omegaconf import DictConfig
 import logging
 import time
+import gc
 
 from verl.workers.rollout.vllm_rollout import vLLMRollout
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
@@ -72,6 +73,7 @@ class ValidationVLLMManager:
         self.vllm_rollout = None
         self.sharding_manager = None
         self._vllm_initialized = False
+        self._generation_count = 0
         
     def _initialize_vllm(self):
         """Initialize vLLM rollout and sharding manager lazily."""
@@ -126,6 +128,12 @@ class ValidationVLLMManager:
             # Use sharding manager context for model switching
             with self.sharding_manager:
                 yield self
+            
+            # Periodic cleanup every 10 validations to prevent memory accumulation
+            self._generation_count += 1
+            if self._generation_count % 10 == 0:
+                logger.info(f"Performing periodic vLLM cleanup after {self._generation_count} validations")
+                self._periodic_cleanup()
                 
         except Exception as e:
             logger.error(f"Error in validation context: {e}")
@@ -206,6 +214,27 @@ class ValidationVLLMManager:
         # logger.info(f"Decoded responses in {end:.4f} seconds")
         return decoded_responses
     
+    def _periodic_cleanup(self):
+        """Periodically reinitialize vLLM to prevent memory accumulation"""
+        try:
+            # Cleanup existing vLLM resources
+            if self.vllm_rollout and hasattr(self.vllm_rollout, 'inference_engine'):
+                if hasattr(self.vllm_rollout.inference_engine, 'cleanup'):
+                    self.vllm_rollout.inference_engine.cleanup()
+            
+            # Reset initialization flag
+            self._vllm_initialized = False
+            self.vllm_rollout = None
+            self.sharding_manager = None
+            
+            # Force garbage collection
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            logger.info("Periodic vLLM cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during periodic cleanup: {e}")
+    
     def cleanup(self):
         """Clean up resources."""
         if self.vllm_rollout and hasattr(self.vllm_rollout, 'inference_engine'):
@@ -215,3 +244,9 @@ class ValidationVLLMManager:
         if self.sharding_manager:
             # Sharding manager cleanup is handled by its context manager
             pass
+        
+        # Reset state
+        self._vllm_initialized = False
+        self.vllm_rollout = None
+        self.sharding_manager = None
+        self._generation_count = 0

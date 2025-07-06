@@ -18,6 +18,8 @@ from omegaconf import DictConfig
 import numpy as np
 from multiprocessing import Pool
 import functools
+import gc
+import psutil
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data import (
@@ -47,7 +49,28 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_name, get_torch_device
 import logging
 
+# Import reward score modules at module level to avoid repeated imports
+from veomni.utils.reward_score.medical import compute_score as medical_compute_score
+from veomni.utils.reward_score.ifeval import ifeval
+from veomni.utils.reward_score.healthbench import healthbench
+
 logger = helper.create_logger(__name__)
+
+# Create a global multiprocessing pool to avoid repeated creation
+SCORE_POOL = None
+
+def get_score_pool():
+    global SCORE_POOL
+    if SCORE_POOL is None:
+        SCORE_POOL = Pool(processes=2)
+    return SCORE_POOL
+
+def cleanup_score_pool():
+    global SCORE_POOL
+    if SCORE_POOL is not None:
+        SCORE_POOL.close()
+        SCORE_POOL.join()
+        SCORE_POOL = None
 
 
 def extract_content(solution_str):
@@ -67,13 +90,10 @@ def extract_content(solution_str):
 def compute_score(generation_result: Dict[str, Any], ground_truth: str, data_source: str) -> float:
     generation_result = extract_content(generation_result)
     if data_source in ['hoanganh/Medical-Train', 'TsinghuaC3I/MedXpertQA', 'hoanganh/MedQA-Test']:
-        from veomni.utils.reward_score.medical import compute_score
-        res = compute_score(generation_result, ground_truth)
+        res = medical_compute_score(generation_result, ground_truth)
     elif data_source in ['google/IFEval']:
-        from veomni.utils.reward_score.ifeval import ifeval
         res = ifeval.compute_score(generation_result, ground_truth)
     elif data_source in ['openai/HealthBench']:
-        from veomni.utils.reward_score.healthbench import healthbench
         res = healthbench.compute_score(generation_result, ground_truth)
     else:
         raise NotImplementedError(f"Unsupported dataset: {data_source}. Please implement compute_score for this dataset.")
@@ -82,6 +102,16 @@ def compute_score(generation_result: Dict[str, Any], ground_truth: str, data_sou
 def compute_score_wrapper(args):
     generation_result, ground_truth, dataset_name = args
     return compute_score(generation_result['response'], ground_truth, dataset_name)
+
+
+def log_memory_usage(step_name: str, logger):
+    """Log current memory usage for debugging"""
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        logger.info(f"{step_name} - RSS: {mem_info.rss / 1024**3:.2f} GB, VMS: {mem_info.vms / 1024**3:.2f} GB")
+    except Exception as e:
+        logger.warning(f"Failed to log memory usage: {e}")
 
 
 @dataclass
@@ -257,9 +287,9 @@ def run_validation(
                         # Prepare arguments for multiprocessing
                         score_args = [(gen_result, gt, ds_name) for gen_result, gt, ds_name in zip(generation_results, reward_models, dataset_names)]
                         
-                        # Use multiprocessing to compute scores in parallel
-                        with Pool(processes=2) as pool:  # Limit to 2 processes to avoid overhead
-                            scores = pool.map(compute_score_wrapper, score_args)
+                        # Use global multiprocessing pool to compute scores in parallel
+                        pool = get_score_pool()
+                        scores = pool.map(compute_score_wrapper, score_args)
                         
                         # Update metrics per dataset
                         for (generation_result, ground_truth, dataset_name), score in zip(zip(generation_results, reward_models, dataset_names), scores):
@@ -281,6 +311,13 @@ def run_validation(
     # Aggregate per-dataset metrics across all GPUs
     val_metrics = all_gather_defaultdict_v1(dataset_metrics)
     logger.info_rank0(f"Gathered metrics from datasets across all GPUs: {val_metrics}")
+    
+    # Clear accumulated data structures to prevent memory leak
+    for dataset_name in dataset_metrics:
+        dataset_metrics[dataset_name]['scores'].clear()
+        dataset_metrics[dataset_name]['prompt_lengths'].clear()
+        dataset_metrics[dataset_name]['response_lengths'].clear()
+    del dataset_metrics
 
     val_metrics_summary = {}
     if args.train.global_rank == 0:
@@ -293,6 +330,11 @@ def run_validation(
             logger.info_rank0(f"Gathered '{dataset_name}' successfully - {metrics['total_samples']} samples, ")
 
     model.train()  # Switch back to training mode
+    
+    # Explicit memory cleanup
+    torch.cuda.empty_cache()
+    gc.collect()
+    
     return val_metrics_summary
 
 
@@ -658,6 +700,11 @@ def main():
             validation_metrics = {}
             if val_dataloader and (global_step % args.train.validation_steps == 0 or global_step == 1):
                 logger.info_rank0(f"Starting validation at step {global_step}")
+                
+                # Log memory before validation
+                if args.train.global_rank == 0:
+                    log_memory_usage(f"Before validation at step {global_step}", logger)
+                
                 # offload_fsdp_model_to_cpu(model)
                 # offload_fsdp_optimizer(optimizer=optimizer)
                 validation_metrics = run_validation(
@@ -670,6 +717,28 @@ def main():
                     validation_manager=validation_manager,
                     limit_batches=args.train.validation_limit,
                 )
+                
+                # Log memory after validation
+                if args.train.global_rank == 0:
+                    log_memory_usage(f"After validation at step {global_step}", logger)
+                
+                # Periodic full cleanup of validation manager every 100 validation steps
+                if global_step % (args.train.validation_steps * 100) == 0:
+                    logger.info_rank0(f"Performing full validation manager cleanup at step {global_step}")
+                    validation_manager.cleanup()
+                    # Reinitialize validation manager
+                    validation_manager = ValidationVLLMManager(
+                        fsdp_model=model,
+                        model_path=args.model.model_path,
+                        tokenizer=tokenizer,
+                        model_hf_config=model_config,
+                        vllm_config=vllm_config,
+                        device_mesh=rollout_device_mesh,
+                        full_params=False,
+                        offload_param=True,
+                        load_format='dummy_hf',
+                        layered_summon=True
+                    )
                 load_fsdp_model_to_gpu(model.cuda())
                 # load_fsdp_optimizer(optimizer=optimizer, device_id=get_torch_device().current_device())
                 
@@ -772,6 +841,11 @@ def main():
         save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
+    # Cleanup resources before destroying process group
+    cleanup_score_pool()
+    if 'validation_manager' in locals():
+        validation_manager.cleanup()
+    
     dist.barrier()
     dist.destroy_process_group()
 
