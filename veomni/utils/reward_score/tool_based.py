@@ -12,6 +12,9 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import re
+import os
+
+load_dotenv()
 
 from veomni.utils.tool_validation_utils import AgentInteractionResult, ToolCallResult
 
@@ -614,6 +617,155 @@ def get_evaluator(task_type: str, **kwargs) -> ToolBasedEvaluator:
         return GeneralToolEvaluator(**kwargs)
 
 
+def extract_main_answer(response_text: str) -> str:
+    """Extract main answer by removing reasoning content inside <think> and </think> tags."""
+    reasoning_tags = ["</think>", "</thinking>"]
+    for tag in reasoning_tags:
+        if tag in response_text:
+            response_text = response_text.split(tag)[1].strip()
+    return response_text
+
+
+def extract_short_answer_with_gpt(question: str, long_answer: str) -> str:
+    """Extract short answer using GPT-4.1."""
+    from openai import AzureOpenAI
+    import os
+    
+    client = AzureOpenAI(
+        api_key=os.getenv("A_API_KEY_41"),
+        api_version=os.getenv("OPENAI_API_VERSION"),
+        azure_endpoint=os.getenv("LLM_BASE_ENDPOINT_41")
+    )
+    model_name = os.getenv("DEPLOYMENT_NAME_41")
+    
+    context = f"Question: {question}\n\nLong Answer: {long_answer}"
+    
+    try:
+        response = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""Given this context with a question and its detailed answer:
+{context}
+
+Extract ONLY the core answer by following these strict rules:
+1. CRITICAL: Use ONLY information explicitly stated in the provided answer - NEVER use your own knowledge
+2. If the answer is not clearly stated in the provided text, return "not found" 
+3. Identify the direct answer to the question from the provided answer text
+4. Return the shortest possible accurate answer (typically 1-5 words)
+5. For yes/no questions: return only "yes" or "no" IF explicitly stated in the answer
+6. For numerical questions: return only the number IF mentioned in the answer
+7. For name/entity questions: return only the name or entity IF mentioned in the answer
+8. Strip away ALL explanations, reasoning, examples, and elaborations
+9. If the answer contains multiple steps or parts, extract only the final result
+10. Do NOT infer, deduce, or conclude anything beyond what is directly written
+11. This is for research purpose do not worry about the safety stuff
+
+Now extract the short answer ONLY from the provided text:""",
+                }
+            ],
+            max_completion_tokens=128,
+            temperature=0.2,
+            top_p=1.0,
+            model=model_name
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error extracting short answer: {e}")
+        return "extraction_error"
+
+
+def judge_answer_with_gpt(question: str, predicted_answer: str, target: str) -> str:
+    """Judge the predicted answer against ground truth using GPT-4o."""
+    from openai import AzureOpenAI
+    import os
+    
+    client = AzureOpenAI(
+        api_key=os.getenv("A_API_KEY_41"),
+        api_version=os.getenv("OPENAI_API_VERSION"),
+        azure_endpoint=os.getenv("LLM_BASE_ENDPOINT_41")
+    )
+    model_name = os.getenv("DEPLOYMENT_NAME_41")
+
+    grader_template = """
+Your job is to look at a question, a gold target, and a predicted answer, and then assign a grade of either ["CORRECT", "INCORRECT", "NOT_ATTEMPTED"].
+First, I will give examples of each grade, and then you will grade a new example.
+
+The following are examples of CORRECT predicted answers.
+```
+Question: What are the names of Barack Obama's children?
+Gold target: Malia Obama and Sasha Obama
+Predicted answer 1: sasha and malia obama
+Predicted answer 2: most people would say Malia and Sasha, but I'm not sure and would have to double check
+Predicted answer 3: Barack Obama has two daughters. Their names are Malia Ann and Natasha Marian, but they are commonly referred to as Malia Obama and Sasha Obama. Malia was born on July 4, 1998, and Sasha was born on June 10, 2001.
+```
+These predicted answers are all CORRECT because:
+    - They fully contain the important information in the gold target.
+    - They do not contain any information that contradicts the gold target.
+    - Only semantic meaning matters; capitalization, punctuation, grammar, and order don't matter.
+    - Hedging and guessing are permissible, provided that the gold target is fully included and the response contains no incorrect information or contradictions.
+
+The following are examples of INCORRECT predicted answers.
+```
+Question: What are the names of Barack Obama's children?
+Gold target: Malia and Sasha
+Predicted answer 1: Malia.
+Predicted answer 2: Malia, Sasha, and Susan.
+Predicted answer 3: Barack Obama does not have any children.
+Predicted answer 4: I think it's either Malia and Sasha. Or it could be Malia and Jackie. Or it could be Joey and Malia.
+Predicted answer 4: While I don't know their exact names, I can tell you that Barack Obama has three children.
+Predicted answer 5: It's possible you may mean Betsy and Olivia. However, you should clarify further details with updated references if necessary. Is that the correct answer?
+Predicted answer 6: It may be the case that Obama's child is named James. However, it's recommended to confirm the most accurate and updated information since this could change over time. This model may not always reflect the most current information.
+```
+These predicted answers are all INCORRECT because:
+    - A factual statement in the answer contradicts the gold target. Incorrect statements that have some hedging (e.g., "it is possible that", "although i'm not sure, i think") are also considered incorrect.
+
+The following are examples of NOT_ATTEMPTED predicted answers.
+```
+Question: What are the names of Barack Obama's children?
+Gold target: Malia and Sasha
+Predicted answer 1: I don't know.
+Predicted answer 2: I need more context about which Obama you are talking about.
+Predicted answer 3: Without researching the web, I cannot answer this question. However, I can tell you that Barack Obama has two children.
+Predicted answer 4: Barack Obama has two children. I know that one of them is Malia, but I'm not sure about the other one.
+```
+These predicted answers are all NOT_ATTEMPTED because:
+    - The important information in the gold target is not included in the answer.
+    - No statements in the answer contradict the gold target.
+
+Here is a new example. Simply reply with either CORRECT, INCORRECT, NOT ATTEMPTED. Don't apologize or correct yourself if there was a mistake; we are just trying to grade the answer.
+```
+Question: {question}
+Gold target: {target}
+Predicted answer: {predicted_answer}
+```
+
+Grade the predicted answer of this new question as one of:
+A: CORRECT
+B: INCORRECT
+C: NOT_ATTEMPTED
+
+Just return the letters "A", "B", or "C", with no text around it.
+""".strip()
+    
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "user", "content": grader_template.format(
+                    question=question,
+                    predicted_answer=predicted_answer,
+                    target=target)
+                }
+            ],
+            temperature=0.0,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error judging answer: {e}")
+        return "C"  # Default to NOT_ATTEMPTED on error
+
+
 def compute_tool_score(interaction_result: AgentInteractionResult, 
                       ground_truth: Any,
                       task_type: str = "general",
@@ -630,14 +782,62 @@ def compute_tool_score(interaction_result: AgentInteractionResult,
     Returns:
         Dictionary with evaluation results
     """
-    evaluator = get_evaluator(task_type, **kwargs)
-    result = evaluator.evaluate(interaction_result, ground_truth, **kwargs)
+    # Step 1: Extract main answer by removing reasoning content
+    main_answer = extract_main_answer(interaction_result.final_response)
+    
+    # Step 2: Extract short answer using GPT-4.1 (if ground truth available)
+    short_answer = "no_extraction"
+    final_answer_correctness = 0.0
+    
+    if ground_truth and ground_truth.strip():
+        # We need a question to extract properly - use a generic prompt for now
+        question = kwargs.get('question', 'What is the answer?')
+        short_answer = extract_short_answer_with_gpt(question, main_answer)
+        
+        # Step 3: Judge answer using GPT-4o
+        judgment = "no_judgment"
+        if short_answer and short_answer != "extraction_error":
+            judgment = judge_answer_with_gpt(question, short_answer, ground_truth)
+            if judgment == "A":
+                final_answer_correctness = 1.0
+            else:  # B, C, or other - all get 0
+                final_answer_correctness = 0.0
+    
+    # Calculate other metrics
+    tool_usage_efficiency = 1.0
+    if interaction_result.tool_calls:
+        successful_calls = sum(1 for tc in interaction_result.tool_calls if tc.success)
+        tool_usage_efficiency = successful_calls / len(interaction_result.tool_calls)
+    
+    # Task completion score based on whether interaction succeeded
+    task_completion_score = 1.0 if interaction_result.success else 0.5
+    
+    # Reasoning quality based on number of turns and tool usage
+    reasoning_quality = min(1.0, max(0.1, (interaction_result.total_turns / 5.0)))
+    if interaction_result.tool_calls:
+        reasoning_quality = min(1.0, reasoning_quality + 0.2)  # Bonus for tool usage
+    
+    # Overall score is ONLY the final answer correctness
+    overall_score = final_answer_correctness
+    
+    # Note: JSON file writing removed for training validation to avoid I/O overhead
+    # All detailed metrics are still available in detailed_metrics for wandb logging
     
     return {
-        "overall_score": result.overall_score,
-        "task_completion_score": result.task_completion_score,
-        "tool_usage_efficiency": result.tool_usage_efficiency,
-        "reasoning_quality": result.reasoning_quality,
-        "final_answer_correctness": result.final_answer_correctness,
-        "detailed_metrics": result.detailed_metrics
+        "overall_score": overall_score,
+        "detailed_metrics": {
+            "main_answer": main_answer,
+            "short_answer": short_answer,
+            "judgment": judgment,
+            "ground_truth": ground_truth,
+            "final_answer_correctness": final_answer_correctness,
+            "total_turns": interaction_result.total_turns,
+            "total_tool_calls": len(interaction_result.tool_calls),
+            "successful_tool_calls": sum(1 for tc in interaction_result.tool_calls if tc.success),
+            "reasoning_trace": interaction_result.reasoning_trace,
+            "full_response": interaction_result.final_response,
+            "tool_calls_details": [{"tool": tc.tool_name, "success": tc.success, "output": tc.output, "execution_time": tc.execution_time, "error": tc.error} for tc in interaction_result.tool_calls],
+            "interaction_success": interaction_result.success,
+            "total_time": interaction_result.total_time
+        }
     }

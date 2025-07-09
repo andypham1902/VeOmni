@@ -136,6 +136,8 @@ class AgentActorManager:
         if interaction_id is None:
             interaction_id = f"interaction_{int(time.time() * 1000)}"
         
+        import json  # Move import to top of function
+        
         start_time = time.time()
         turns = []
         
@@ -202,7 +204,7 @@ class AgentActorManager:
                     break
                 
                 raw_response = responses[0]["response"]
-                tokens_used = responses[0]["response_length"]
+                tokens_used = responses[0].get("response_length", len(raw_response.split()))  # Fallback to word count
                 
                 # Parse the 3 response types (similar to simple_llm_agent_test.py)
                 reasoning_content = None
@@ -228,35 +230,75 @@ class AgentActorManager:
                         "content": ""
                     }))
                 
-                # Check for function calls in the content
-                function_pattern = r'(web_search|web_visit|python|bash|search)\s*\(([^)]*)\)'
-                func_matches = re.findall(function_pattern, regular_content)
+                # Check for function calls - handle the JSON format the model is actually generating
+                function_call = None
                 
-                if func_matches:
-                    func_name, func_args_str = func_matches[0]
-                    
-                    # Parse function arguments
+                # Try to find and parse the entire JSON function call
+                json_pattern = r'\{[^{}]*"name"[^{}]*"arguments"[^{}]*\{[^{}]*\}[^{}]*\}'
+                json_matches = re.findall(json_pattern, regular_content, re.DOTALL)
+                
+                if json_matches:
                     try:
-                        # Try to extract JSON arguments
-                        json_match = re.search(r'\{.*\}', func_args_str)
-                        if json_match:
-                            func_args = json.loads(json_match.group())
-                        else:
-                            # Simple string parsing
-                            func_args = self._parse_function_args(func_name, func_args_str)
-                    except:
-                        func_args = {'input': func_args_str.strip()}
+                        # Parse the entire JSON object
+                        json_str = json_matches[0]
+                        func_call_obj = json.loads(json_str)
+                        
+                        function_call = {
+                            'name': func_call_obj['name'],
+                            'arguments': func_call_obj['arguments']
+                        }
+                    except Exception as e:
+                        # If JSON parsing fails, try regex extraction
+                        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', json_str)
+                        args_match = re.search(r'"arguments"\s*:\s*(\{[^}]*\})', json_str)
+                        
+                        if name_match and args_match:
+                            func_name = name_match.group(1)
+                            try:
+                                func_args = json.loads(args_match.group(1))
+                            except:
+                                func_args = {'input': args_match.group(1)}
+                            
+                            function_call = {
+                                'name': func_name,
+                                'arguments': func_args
+                            }
+                else:
+                    # Try XML format as fallback
+                    xml_pattern = r"<tool_call>\s*(\w+)\s*</tool_call>\s*<tool_input>\s*(.*?)\s*</tool_input>"
+                    xml_matches = re.findall(xml_pattern, regular_content, re.DOTALL | re.IGNORECASE)
                     
-                    function_call = {
-                        'name': func_name,
-                        'arguments': func_args
-                    }
-                
-                # Add assistant response to messages (without reasoning in history)
-                messages.append({
-                    "role": "assistant",
-                    "content": regular_content
-                })
+                    if xml_matches:
+                        func_name, func_args_str = xml_matches[0]
+                        try:
+                            func_args = json.loads(func_args_str)
+                        except:
+                            func_args = {'input': func_args_str.strip()}
+                            
+                        function_call = {
+                            'name': func_name,
+                            'arguments': func_args
+                        }
+                    else:
+                        # Try function call format as last resort
+                        func_pattern = r'(web_search|web_visit|python|bash|search)\s*\(([^)]*)\)'
+                        func_matches = re.findall(func_pattern, regular_content)
+                        
+                        if func_matches:
+                            func_name, func_args_str = func_matches[0]
+                            try:
+                                json_match = re.search(r'\{.*\}', func_args_str)
+                                if json_match:
+                                    func_args = json.loads(json_match.group())
+                                else:
+                                    func_args = self._parse_function_args(func_name, func_args_str)
+                            except:
+                                func_args = {'input': func_args_str.strip()}
+                            
+                            function_call = {
+                                'name': func_name,
+                                'arguments': func_args
+                            }
                 
                 conversation_log.append({
                     'turn': turn_number,
@@ -293,21 +335,16 @@ class AgentActorManager:
                         "content": formatted_response
                     }))
                     
-                    # Add function call to messages
+                    # Add function call to messages (assistant with tool_call)
                     messages.append({
                         "role": "assistant",
-                        "content": regular_content,
-                        "function_call": {
-                            "name": func_name,
-                            "arguments": json.dumps(func_args)
-                        }
+                        "content": regular_content  # This includes the <tool_call>...</tool_call>
                     })
                     
-                    # Add function result to messages
+                    # Add function result to messages as user message
                     messages.append({
-                        "role": "function",
-                        "name": func_name,
-                        "content": result.output
+                        "role": "user",
+                        "content": result.output  # Tool result as user message
                     })
                     
                     tool_results.append(result)
@@ -326,6 +363,12 @@ class AgentActorManager:
                         "role": "assistant", 
                         "content": regular_content
                     }))
+                    
+                    # Add final assistant message to conversation
+                    messages.append({
+                        "role": "assistant",
+                        "content": regular_content
+                    })
                     
                     # No function calls and has content - this is the final answer
                     status = AgentStatus.COMPLETED
@@ -377,6 +420,9 @@ class AgentActorManager:
                 total_time=time.time() - start_time,
                 reasoning_trace=[f"Turn {turn.turn_number}: {turn.response}" for turn in turns]
             )
+            
+            # Add messages field for logging
+            result.messages = messages
             
             return result
             
