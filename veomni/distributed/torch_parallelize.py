@@ -78,8 +78,8 @@ def build_parallelize_model(
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP1 training supports `enable_fsdp_offload`.")
 
-    if enable_mixed_precision:  # upcast to float32 before feed it to optimizer
-        model = model.float()
+    # Remove problematic float32 upcasting - keep model in original precision
+    # Mixed precision should be handled by FSDP, not by manual upcasting
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
@@ -124,7 +124,7 @@ def build_parallelize_model(
                 logger.info_rank0("Enable mixed precision training.")
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
+                    reduce_dtype=torch.bfloat16,  # Use bfloat16 for gradient reduction too
                     output_dtype=torch.bfloat16,
                 )
                 fsdp_kwargs["mp_policy"] = mp_policy

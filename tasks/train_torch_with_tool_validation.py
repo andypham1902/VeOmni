@@ -601,64 +601,48 @@ def main():
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype=torch_dtype,
+        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
-        config_kwargs=config_kwargs,
+        init_device=args.train.init_device,
     )
-    model.to(f"cuda:{args.train.local_rank}")
-    model.train()
+    model_config = model.config
+    helper.print_device_mem_info("VRAM usage after building model")
 
-    logger.info_rank0("Build optimizer and lr scheduler")
-    optimizer = build_optimizer(
-        model=model,
-        lr=args.train.lr,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=args.train.weight_decay,
-        optimizer_type=args.train.optimizer,
-    )
-    
-    # Add environment meter for periodic cache clearing
-    environ_meter = helper.EnvironMeter(
-        config=model.config,
-        global_batch_size=args.train.global_batch_size,
-        rmpad=args.train.rmpad,
-        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
-        empty_cache_steps=args.train.empty_cache_steps,
-    )
-    lr_scheduler = build_lr_scheduler(
-        optimizer=optimizer,
-        train_steps=args.train.train_steps,
-        lr=args.train.lr,
-        lr_decay_style=args.train.lr_decay_style,
-        lr_decay_ratio=args.train.lr_decay_ratio,
-        lr_warmup_ratio=args.train.lr_warmup_ratio,
-        lr_min=args.train.lr_min,
-        lr_start=args.train.lr_start,
-    )
-
-    if args.train.load_checkpoint_path:
-        logger.info_rank0(f"Load checkpoint from {args.train.load_checkpoint_path}")
-        checkpoint = Checkpointer.load_checkpoint(args.train.load_checkpoint_path)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        start_step = checkpoint["step"] + 1
-        logger.info_rank0(f"Loaded checkpoint from step {start_step - 1}")
-    else:
-        start_step = 0
-
-    logger.info_rank0("Apply model parallelism")
+    get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     model = build_parallelize_model(
         model,
+        init_device=args.train.init_device,
+        weights_path=args.model.model_path,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
-        basic_modules=args.model.basic_modules,
-        enable_reentrant=args.train.enable_reentrant,
         enable_fsdp_offload=args.train.enable_fsdp_offload,
-        init_device=args.train.init_device,
+        basic_modules=model._no_split_modules + args.model.basic_modules,
+        enable_reentrant=args.train.enable_reentrant,
+        enable_forward_prefetch=args.train.enable_forward_prefetch,
+    )
+
+    optimizer = build_optimizer(
+        model,
+        lr=args.train.lr,
+        weight_decay=args.train.weight_decay,
+        fused=True,
+        optimizer_type=args.train.optimizer,
+    )
+    if get_optimizer_pre_hook is not None:
+        optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
+        optimizer.register_step_pre_hook(optimizer_pre_hook)
+    
+    lr_scheduler = build_lr_scheduler(
+        optimizer,
+        train_steps=args.train.train_steps * args.train.num_train_epochs,
+        lr=args.train.lr,
+        lr_min=args.train.lr_min,
+        lr_decay_style=args.train.lr_decay_style,
+        lr_decay_ratio=args.train.lr_decay_ratio,
+        lr_warmup_ratio=args.train.lr_warmup_ratio,
+        lr_start=args.train.lr_start,
     )
 
     # Initialize validation manager
@@ -716,97 +700,122 @@ def main():
             config={**vars(args.model), **vars(args.data), **vars(args.train)},
         )
 
-    logger.info_rank0("Start training")
-    
-    # Training loop
-    step = start_step
-    
+    start_epoch, start_step, global_step = 0, 0, 0
+    save_checkpoint_path = None
+    environ_meter = helper.EnvironMeter(
+        config=model_config,
+        global_batch_size=args.train.global_batch_size,
+        rmpad=args.train.rmpad,
+        rmpad_with_pos_ids=args.train.rmpad_with_pos_ids,
+        empty_cache_steps=args.train.empty_cache_steps,
+    )
+
+    if args.train.load_checkpoint_path:
+        state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
+        Checkpointer.load(args.train.load_checkpoint_path, state)
+        global_step = state["extra_state"]["global_step"]
+        start_epoch = global_step // args.train.train_steps
+        start_step = global_step % args.train.train_steps
+        lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+        train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
+        environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
+        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+        if start_step == 0:  # resume at the end of epoch
+            iter(train_dataloader)  # clear resume state and prefetch data
+
+        dist.barrier()
+        logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
+
+    helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
     )
-    
-    # Use proper epoch-based training loop like the working script
-    for epoch in range(args.train.num_train_epochs):
+    model.train()
+    logger.info(
+        f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
+    )
+    for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
-        
+
+        data_loader_tqdm = trange(
+            args.train.train_steps,
+            desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
+            total=args.train.train_steps,
+            initial=start_step,
+            disable=args.train.local_rank != 0,
+        )
         data_iterator = iter(train_dataloader)
-        
-        for batch_idx in range(args.train.train_steps):
-            if args.train.max_steps and step >= args.train.max_steps:
-                break
-            
+        for _ in range(start_step, args.train.train_steps):
+            global_step += 1
+
             try:
-                micro_batches = next(data_iterator)
+                micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
-                logger.info(f"epoch:{epoch} Dataloader finished")
+                logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
-            
+
+            if global_step == 1:
+                helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
+
             total_loss = 0
             
-            # Start timing for this step
             torch.cuda.synchronize()
             start_time = time.time()
-            
-            # Process each micro-batch
             for micro_batch in micro_batches:
-                # Add to environ meter for tracking
                 environ_meter.add(micro_batch)
-                
-                # Move batch to device
-                micro_batch = {k: v.to(f"cuda:{args.train.local_rank}") if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()}
-                
-                # Forward pass
+
+                micro_batch = {
+                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
+                }
                 with model_fwd_context:
-                    outputs = model(**micro_batch)
-                    loss = outputs.loss / len(micro_batches)  # Scale loss by number of micro-batches
-                    total_loss += loss.item()
-                
-                # Backward pass
+                    loss: "torch.Tensor" = model(**micro_batch, use_cache=False).loss.mean() / len(micro_batches)
+
                 with model_bwd_context:
                     loss.backward()
-                
-                # Clear intermediate tensors to prevent memory accumulation
-                del outputs, loss
+
+                total_loss += loss.item()
+                del micro_batch
             
-            # Gradient clipping
-            if args.train.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm)
-            
-            # Optimizer step
+            if args.train.data_parallel_mode == "fsdp1":
+                grad_norm = model.clip_grad_norm_(args.train.max_grad_norm).item()
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.train.max_grad_norm, foreach=True)
+
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            
-            # Calculate timing and update environment meter
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm = grad_norm.full_tensor().item()
+
+            # collect mean loss across data parallel group
+            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
             torch.cuda.synchronize()
             delta_time = time.time() - start_time
-            train_metrics = environ_meter.step(delta_time=delta_time, global_step=step)
-            
-            # Average loss across micro-batches
-            avg_loss = total_loss
-            
-            # Clear micro_batches reference to prevent memory accumulation
-            del micro_batches
-        
-            # Logging
-            if step % 10 == 0:
-                logger.info_rank0(f"Step {step}, Loss: {avg_loss:.6f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}")
-                
-                if args.train.global_rank == 0 and args.train.use_wandb:
-                    import wandb
-                    wandb.log({
-                        "train/loss": avg_loss,
-                        "train/lr": lr_scheduler.get_last_lr()[0],
-                        "train/step": step,
-                    }, step=step)
-            
-            # Validation
+            lr = max(lr_scheduler.get_last_lr())
+            train_metrics = environ_meter.step(delta_time, global_step=global_step)
+
+            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.update()
+
+            if args.train.global_rank == 0:
+                if args.train.use_wandb:
+                    train_metrics.update(
+                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                    )
+                    wandb.log(train_metrics, step=global_step)
+
+                if args.train.enable_profiling and global_step <= args.train.profile_end_step:
+                    profiler.step()
+                    if global_step == args.train.profile_end_step:
+                        profiler.stop()
+
+            # Validation - keep existing validation logic
             if (validation_manager is not None and 
                 val_dataloader is not None and 
-                step % args.train.validation_steps == 0):
+                global_step % args.train.validation_steps == 0):
                 
-                logger.info_rank0(f"Running validation at step {step}")
+                logger.info_rank0(f"Running validation at step {global_step}")
                 
                 # Clear GPU cache before validation
                 torch.cuda.empty_cache()
@@ -818,7 +827,7 @@ def main():
                         if args.train.enable_tool_validation:
                             # Run tool validation (synchronously inside validation context)
                             val_metrics = run_tool_validation(
-                                validation_manager, val_dataloader, args, step
+                                validation_manager, val_dataloader, args, global_step
                             )
                         else:
                             # Run regular validation (implement if needed)
@@ -831,27 +840,7 @@ def main():
                     model.train()
                     logger.info_rank0(f"Restoring FSDP model to training state after validation")
                     
-                    # Periodic full cleanup of validation manager every 100 validation steps
-                    if step % (args.train.validation_steps * 100) == 0:
-                        logger.info_rank0(f"Performing full validation manager cleanup at step {step}")
-                        validation_manager.cleanup()
-                        # Reinitialize validation manager
-                        validation_manager = ToolValidationVLLMManager(
-                            fsdp_model=model,
-                            model_path=args.model.model_path,
-                            tokenizer=tokenizer,
-                            model_hf_config=model.config,
-                            vllm_config=vllm_config,
-                            device_mesh=rollout_device_mesh,
-                            full_params=False,
-                            offload_param=True,
-                            load_format='dummy_hf',
-                            layered_summon=True,
-                            tool_server=tool_server,
-                            max_turns=args.train.max_agent_turns,
-                            tool_call_timeout=args.train.tool_call_timeout,
-                            enable_tool_validation=args.train.enable_tool_validation,
-                        )
+                    # Skip periodic cleanup to avoid vLLM sleep mode conflicts
                     
                     # Properly reload FSDP model to GPU (this is the key fix from working script!)
                     load_fsdp_model_to_gpu(model.cuda())
@@ -862,15 +851,15 @@ def main():
                     
                     # Log validation metrics
                     if args.train.global_rank == 0 and val_metrics:
-                        logger.info_rank0(f"Validation metrics at step {step}: {val_metrics}")
+                        logger.info_rank0(f"Validation metrics at step {global_step}: {val_metrics}")
                         
                         if args.train.use_wandb:
                             import wandb
                             wandb_metrics = {f"val/{k}": v for k, v in val_metrics.items()}
-                            wandb_metrics["train/step"] = step
-                            wandb.log(wandb_metrics, step=step)
+                            wandb_metrics["train/step"] = global_step
+                            wandb.log(wandb_metrics, step=global_step)
                 except Exception as e:
-                    logger.info_rank0(f"Validation failed at step {step}: {e}")
+                    logger.info_rank0(f"Validation failed at step {global_step}: {e}")
                     import traceback
                     traceback.print_exc()
                 finally:
@@ -888,40 +877,56 @@ def main():
                     gc.collect()
             
             # Checkpointing
-            if step % args.train.save_steps == 0 and step > 0:
-                logger.info_rank0(f"Saving checkpoint at step {step}")
-                save_checkpoint_path = os.path.join(args.train.output_dir, f"global_step_{step}")
-                state = {
-                    "model": model,
-                    "optimizer": optimizer,
-                    "extra_state": {
-                        "global_step": step,
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "torch_rng_state": torch.get_rng_state(),
-                    },
-                }
-                Checkpointer.save(save_checkpoint_path, state, global_steps=step)
-                dist.barrier()
-                logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+            if global_step % args.train.save_steps == 0:
+                logger.info_rank0(f"Saving checkpoint at step {global_step}")
+                
+                # Aggressive memory cleanup before checkpointing
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                save_checkpoint_path = os.path.join(args.train.output_dir, f"global_step_{global_step}")
+                
+                # Create state dict with minimal memory overhead
+                try:
+                    state = {
+                        "model": model,
+                        "optimizer": optimizer,
+                        "extra_state": {
+                            "global_step": global_step,
+                            "lr_scheduler": lr_scheduler.state_dict(),
+                            "torch_rng_state": torch.get_rng_state(),
+                        },
+                    }
+                    Checkpointer.save(save_checkpoint_path, state, global_steps=global_step)
+                    dist.barrier()
+                    logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
+                except Exception as e:
+                    logger.info_rank0(f"Checkpoint saving failed: {e}")
+                    # Continue training even if checkpoint fails
+                finally:
+                    # Clear any temporary checkpoint memory
+                    if 'state' in locals():
+                        del state
+                    torch.cuda.empty_cache()
+                    gc.collect()
             
-            step += 1
     
     logger.info_rank0("Training completed")
     
     # Final checkpoint
     if args.train.global_rank == 0:
         logger.info_rank0("Saving final checkpoint")
-        save_checkpoint_path = os.path.join(args.train.output_dir, f"global_step_{step}")
+        save_checkpoint_path = os.path.join(args.train.output_dir, f"global_step_{global_step}")
         state = {
             "model": model,
             "optimizer": optimizer,
             "extra_state": {
-                "global_step": step,
+                "global_step": global_step,
                 "lr_scheduler": lr_scheduler.state_dict(),
                 "torch_rng_state": torch.get_rng_state(),
             },
         }
-        Checkpointer.save(save_checkpoint_path, state, global_steps=step)
+        Checkpointer.save(save_checkpoint_path, state, global_steps=global_step)
         dist.barrier()
         logger.info_rank0(f"Final checkpoint saved at {save_checkpoint_path} successfully!")
     

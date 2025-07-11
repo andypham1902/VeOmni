@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import re
 import os
+from dotenv import load_dotenv
 
 load_dotenv()
 

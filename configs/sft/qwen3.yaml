@@ -1,61 +1,60 @@
 model:
-  model_path: "Qwen/Qwen3-4B"
+  model_path: /mnt/sharefs/tuenv/model_hub/qwen3/qwen3-4b
   attn_implementation: flash_attention_2
-  tokenizer_path: "Qwen/Qwen3-4B"
+  tokenizer_path: /mnt/sharefs/tuenv/model_hub/qwen3/qwen3-4b
   # rope_scaling:
   #   rope_type: "dynamic"
-  #   factor: 3.2  # Disabled due to Ulysses compatibility
+  #   factor: 3.2
 
 data:
   train_path: /home/slurm/hoanganh/VeOmni/_data/musique_concatenated.arrow
   val_path: /home/slurm/hoanganh/VeOmni/_data/test_simpleqa_frames.parquet
   data_type: conversation
   chat_template: chatml
-  max_seq_len: 16384  # 16k context - optimal for 4B model
+  max_seq_len: 16384
   text_keys: prompt
-  pin_memory: false
-  drop_last: true
   dataloader_type: native
   datasets_type: mapping
-  num_workers: 2     # Reduced to save memory
-  prefetch_factor: 2  # Reduced to save memory
+  # num_workers: 2     # Reduced to save memory
+  # prefetch_factor: 2  # Reduced to save memory
+  train_size: 485133  # Total number of training samples
 
 train:
-  output_dir: /mnt/sharefs/hoanganh/ckpts/qwen3_test
+  output_dir: /mnt/sharefs/hoanganh/ckpts/qwen3_4b_tools
   data_parallel_mode: fsdp1
   ulysses_parallel_size: 1  # Keep disabled for stability
-  global_batch_size: 64    # Increased for proper gradient accumulation
+  global_batch_size: 32
   micro_batch_size: 1       
   # Gradient accumulation: 64/(1*8) = 8 steps per GPU
-  num_train_epochs: 10
   rmpad: false
-  rmpad_with_pos_ids: false  # Disable dynamic batching to avoid assertion error
+  rmpad_with_pos_ids: true
+  num_train_epochs: 5
   bsz_warmup_ratio: 0.0  # Disable batch size warmup
-  dyn_bsz_margin: 1024      # Reduced margin to allow more samples
-  dyn_bsz_buffer_size: 100  # Increase buffer size significantly
+  dyn_bsz_margin: 0      # Reduced margin to allow more samples
+  dyn_bsz_buffer_size: 200  # Increase buffer size significantly
   optimizer: adamw
-  lr: 2.0e-5              # Optimized learning rate for SFT
-  lr_warmup_ratio: 0.05   # 5% warmup (more appropriate for long training)
+  lr: 1.0e-5              # Conservative learning rate for stable SFT
+  lr_warmup_ratio: 0.1    # 10% warmup for better stability
   lr_decay_style: cosine
-  lr_decay_ratio: 1.0
-  weight_decay: 0.1       # Slightly higher weight decay for regularization
-  max_grad_norm: 2.0
+  lr_decay_ratio: 0.5
+  weight_decay: 0.001      # Reduced weight decay to prevent high gradient norms
+  max_grad_norm: 1.0
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
-  enable_fsdp_offload: false  # Disable to allow gradient accumulation
+  enable_fsdp_offload: false
   enable_activation_offload: false  # Disable to avoid issues
-  init_device: cuda  # Use cuda initialization
+  init_device: meta  # Use cuda initialization
   enable_full_determinism: false
-  empty_cache_steps: 50  # Clear cache every 50 steps to prevent OOM
+  empty_cache_steps: 1999  # Clear cache every 50 steps to prevent OOM
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_steps: 2500        # Save every ~1/3 epoch (2500 steps)
+  save_steps: 2000
   save_hf_weights: true
   use_wandb: true
   wandb_project: veomni_tools
-  wandb_name: qwen3_4b_sft_500k
-  validation_steps: 2500  # Disable validation to isolate training OOM
+  wandb_name: qwen3_4b_sft_500k_fix_fix
+  validation_steps: 2000
   enable_tool_validation: true
   max_agent_turns: 15             # More turns for complex reasoning
   tool_call_timeout: 60          # Longer timeout for tool execution
