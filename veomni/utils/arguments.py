@@ -83,6 +83,10 @@ class ModelArguments:
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
+    rope_scaling: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={"help": "RoPE scaling configuration for extending context length."},
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
@@ -476,7 +480,8 @@ class TrainingArguments:
             token_micro_bsz = self.micro_batch_size * max_seq_len
             train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
             eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
-            self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
+            # Fix: Remove max_seq_len from denominator for sample-based training
+            self._train_steps = math.ceil(train_size / self.global_batch_size)
         elif dataset_length is not None:
             self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
         elif self.max_steps is not None:
@@ -655,7 +660,9 @@ def parse_args(rootclass: T) -> T:
                 dict_fields.add(f"{base}.{attr.name}")
                 if attr.default_factory is not MISSING:
                     parser_kwargs["default"] = str(attr.default_factory())
-                elif attr.default is MISSING:
+                elif attr.default is not MISSING:
+                    parser_kwargs["default"] = str(attr.default) if attr.default is not None else None
+                else:
                     parser_kwargs["required"] = True
 
             else:
@@ -695,8 +702,13 @@ def parse_args(rootclass: T) -> T:
     parse_result = defaultdict(dict)
     for key, value in vars(args).items():
         if key in dict_fields:
-            if isinstance(value, str) and value.startswith("{"):
+            if value is None:
+                # Handle None values for optional dict arguments
+                pass
+            elif isinstance(value, str) and value.startswith("{"):
                 value = _convert_str_dict(json.loads(value))
+            elif isinstance(value, str) and value.lower() == "none":
+                value = None
             else:
                 raise ValueError(f"Expect a json string for dict argument, but got {value}")
 

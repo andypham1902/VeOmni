@@ -1,57 +1,61 @@
 model:
-  model_path: "Qwen/Qwen3-8B"
+  model_path: /mnt/sharefs/tuenv/model_hub/qwen3/qwen3-4b
   attn_implementation: flash_attention_2
-  tokenizer_path: "Qwen/Qwen3-8B"
+  tokenizer_path: /mnt/sharefs/tuenv/model_hub/qwen3/qwen3-4b
+  # rope_scaling:
+  #   rope_type: "dynamic"
+  #   factor: 3.2
 
 data:
-  train_path: /data/lipsync/andrew/VeOmni/_data/medqa_hb_mcq_41_235b_train_messages_1.parquet
-  val_path: /data/lipsync/andrew/VeOmni/_data/test_medx_medqa_ifeval_hb.parquet
+  train_path: /home/slurm/hoanganh/VeOmni/_data/musique_concatenated.arrow
+  val_path: /home/slurm/hoanganh/VeOmni/_data/test_simpleqa_frames.parquet
   data_type: conversation
   chat_template: chatml
-  max_seq_len: 12288
-  # train_size: 1145097229 #  7,679,732,074 1,139,111,100 329,724,320 it automatic override by train_torch_v2.py scripts # total of tokens/epoch
+  max_seq_len: 16384
   text_keys: prompt
-  pin_memory: false
-  drop_last: true
-  # is_chatml: false
   dataloader_type: native
-  datasets_type: mapping  # or "iterable" for large datasets
-  num_workers: 4  # adjust based on your system
-  prefetch_factor: 2
+  datasets_type: mapping
+  # num_workers: 2     # Reduced to save memory
+  # prefetch_factor: 2  # Reduced to save memory
+  train_size: 485133  # Total number of training samples
 
 train:
-  output_dir: /data/lipsync/andrew/VeOmni/ckpts/qwen3_test
+  output_dir: /mnt/sharefs/hoanganh/ckpts/qwen3_4b_tools
   data_parallel_mode: fsdp1
-  ulysses_parallel_size: 1
+  ulysses_parallel_size: 1  # Keep disabled for stability
   global_batch_size: 32
-  micro_batch_size: 1
-  # token_micro_bsz: 36768 # total of tokens/batch_size
-  num_train_epochs: 10
+  micro_batch_size: 1       
+  # Gradient accumulation: 64/(1*8) = 8 steps per GPU
   rmpad: false
   rmpad_with_pos_ids: true
-  bsz_warmup_ratio: 0.
-  dyn_bsz_margin: 0
-  dyn_bsz_buffer_size: 1
+  num_train_epochs: 5
+  bsz_warmup_ratio: 0.0  # Disable batch size warmup
+  dyn_bsz_margin: 0      # Reduced margin to allow more samples
+  dyn_bsz_buffer_size: 200  # Increase buffer size significantly
   optimizer: adamw
-  lr: 5.0e-5
-  lr_warmup_ratio: 0.1
+  lr: 1.0e-5              # Conservative learning rate for stable SFT
+  lr_warmup_ratio: 0.1    # 10% warmup for better stability
   lr_decay_style: cosine
-  lr_decay_ratio: 1.0
-  weight_decay: 0.01
-  max_grad_norm: 2.0
+  lr_decay_ratio: 0.5
+  weight_decay: 0.001      # Reduced weight decay to prevent high gradient norms
+  max_grad_norm: 1.0
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
   enable_fsdp_offload: false
-  enable_activation_offload: false
-  init_device: cuda
+  enable_activation_offload: false  # Disable to avoid issues
+  init_device: meta  # Use cuda initialization
   enable_full_determinism: false
-  empty_cache_steps: 26
+  empty_cache_steps: 1999  # Clear cache every 50 steps to prevent OOM
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_steps: 1000
+  save_steps: 2000
   save_hf_weights: true
   use_wandb: true
-  wandb_project: veomni_quick_exps
-  wandb_name: qwen3_8b_12k_medqa_hb_mcq_41_235b_1_trace
-  validation_steps: 26
+  wandb_project: veomni_tools
+  wandb_name: qwen3_4b_sft_500k_fix_fix
+  validation_steps: 2000
+  enable_tool_validation: true
+  max_agent_turns: 15             # More turns for complex reasoning
+  tool_call_timeout: 60          # Longer timeout for tool execution
+  agent_total_timeout: 300       # 5 minutes total timeout per sample
